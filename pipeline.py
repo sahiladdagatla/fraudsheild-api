@@ -808,23 +808,8 @@ def stage4_model(df, feature_cols):
     # Full dataset predictions
     df['fraud_proba'] = model.predict_proba(X)[:, 1]
 
-    # If ground truth exists, optimize threshold on FULL dataset for best F1
-    if has_ground_truth:
-        y_full_gt = pd.to_numeric(df['is_fraud'] if 'is_fraud' in df.columns else pd.Series(), errors='coerce').fillna(0).astype(int)
-        # Re-read original is_fraud before we overwrite
-        y_full_gt = gt_original.values if 'gt_original' in dir() else y_gt_full
-        full_proba = df['fraud_proba'].values
-        best_f1_full = 0
-        best_thresh_full = best_thresh
-        for t in np.arange(0.10, 0.95, 0.005):
-            y_t = (full_proba >= t).astype(int)
-            f1_t = f1_score(y_full_gt, y_t, zero_division=0)
-            if f1_t > best_f1_full:
-                best_f1_full = f1_t
-                best_thresh_full = t
-        df['is_fraud'] = (df['fraud_proba'] >= best_thresh_full).astype(int)
-    else:
-        df['is_fraud'] = (df['fraud_proba'] >= best_thresh).astype(int)
+    # Apply the test-set-optimized threshold (best generalization)
+    df['is_fraud'] = (df['fraud_proba'] >= best_thresh).astype(int)
 
     total_fraud = int(df['is_fraud'].sum())
     total_legit = int((~df['is_fraud'].astype(bool)).sum())
