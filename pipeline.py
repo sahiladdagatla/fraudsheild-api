@@ -647,21 +647,65 @@ def stage4_model(df, feature_cols):
         X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
         X_gt = X[valid_labels]
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X_gt, y_gt, test_size=0.2, random_state=42, stratify=y_gt
-        )
+        from sklearn.model_selection import StratifiedKFold
 
-        # SMOTE for extreme imbalance — aggressive oversampling needed
-        fraud_ratio = y_train.sum() / len(y_train)
-        smote_ratio = min(0.5, max(fraud_ratio * 20, 0.2))  # 20x oversample, cap at 50%
+        fraud_ratio = y_gt.sum() / len(y_gt)
+        pos_weight = max(1, int((1 - fraud_ratio) / max(fraud_ratio, 0.001)))
+        smote_ratio = min(0.5, max(fraud_ratio * 20, 0.2))
+
+        # 5-fold CV: collect out-of-fold predictions for robust evaluation
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        oof_proba = np.zeros(len(y_gt))
+        fold_thresholds = []
+
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_gt, y_gt)):
+            X_tr, X_val = X_gt.iloc[train_idx], X_gt.iloc[val_idx]
+            y_tr, y_val = y_gt[train_idx], y_gt[val_idx]
+
+            try:
+                smote = SMOTE(random_state=42, sampling_strategy=smote_ratio)
+                X_tr_res, y_tr_res = smote.fit_resample(X_tr, y_tr)
+            except ValueError:
+                X_tr_res, y_tr_res = X_tr, y_tr
+
+            xgb_fold = XGBClassifier(
+                n_estimators=400, max_depth=6, learning_rate=0.025,
+                subsample=0.85, colsample_bytree=0.85, min_child_weight=3,
+                gamma=0.1, reg_alpha=0.1, reg_lambda=1.5,
+                scale_pos_weight=pos_weight, random_state=42,
+                eval_metric='logloss', n_jobs=-1,
+            )
+            xgb_fold.fit(X_tr_res, y_tr_res)
+            fold_proba = xgb_fold.predict_proba(X_val)[:, 1]
+            oof_proba[val_idx] = fold_proba
+
+            # Find best threshold per fold
+            best_t, best_f = 0.5, 0
+            for t in np.arange(0.05, 0.90, 0.01):
+                f = f1_score(y_val, (fold_proba >= t).astype(int), zero_division=0)
+                if f > best_f:
+                    best_f = f
+                    best_t = t
+            fold_thresholds.append(best_t)
+
+        # Use median threshold across folds
+        best_thresh = float(np.median(fold_thresholds))
+
+        # Evaluate using OOF predictions (every sample predicted when it was in val set)
+        y_pred_oof = (oof_proba >= best_thresh).astype(int)
+        acc = accuracy_score(y_gt, y_pred_oof)
+        prec_val = precision_score(y_gt, y_pred_oof, zero_division=0)
+        rec_val = recall_score(y_gt, y_pred_oof, zero_division=0)
+        f1_val_oof = f1_score(y_gt, y_pred_oof, zero_division=0)
+        auc_oof = roc_auc_score(y_gt, oof_proba)
+
+        # Train final model on ALL data for production predictions
         try:
             smote = SMOTE(random_state=42, sampling_strategy=smote_ratio)
-            X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+            X_full_res, y_full_res = smote.fit_resample(X_gt, y_gt)
         except ValueError:
-            X_train_res, y_train_res = X_train, y_train
+            X_full_res, y_full_res = X_gt, y_gt
 
-        # Ensemble with higher scale_pos_weight for rare fraud
-        pos_weight = max(1, int((1 - fraud_ratio) / max(fraud_ratio, 0.001)))
         xgb_clf = XGBClassifier(
             n_estimators=400, max_depth=6, learning_rate=0.025,
             subsample=0.85, colsample_bytree=0.85, min_child_weight=3,
@@ -681,21 +725,13 @@ def stage4_model(df, feature_cols):
             estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf)],
             voting='soft', weights=[4, 2, 2],
         )
-        model.fit(X_train_res, y_train_res)
+        model.fit(X_full_res, y_full_res)
 
-        # Fine threshold scan optimizing F1
-        y_proba_test = model.predict_proba(X_test)[:, 1]
-        best_f1 = 0
-        best_thresh = 0.5
-        for t in np.arange(0.05, 0.90, 0.005):
-            y_t = (y_proba_test >= t).astype(int)
-            f1_t = f1_score(y_test, y_t, zero_division=0)
-            if f1_t > best_f1:
-                best_f1 = f1_t
-                best_thresh = t
-
-        y_pred = (y_proba_test >= best_thresh).astype(int)
-        df['ensemble_score'] = 0.0  # no ensemble score in supervised mode
+        # Use OOF metrics for reporting (honest evaluation)
+        y_test = y_gt
+        y_proba_test = oof_proba
+        y_pred = y_pred_oof
+        df['ensemble_score'] = 0.0
 
     else:
         # ===== UNSUPERVISED MODE: IF + Rules consensus (no ground truth) =====
@@ -798,11 +834,19 @@ def stage4_model(df, feature_cols):
                 best_thresh = t
 
         y_pred = (y_proba_test >= best_thresh).astype(int)
-    acc = accuracy_score(y_test, y_pred)
-    prec = precision_score(y_test, y_pred, zero_division=0)
-    rec = recall_score(y_test, y_pred, zero_division=0)
-    f1_val = f1_score(y_test, y_pred, zero_division=0)
-    auc = roc_auc_score(y_test, y_proba_test)
+    # Compute metrics (may already be computed in supervised OOF mode)
+    if has_ground_truth:
+        acc_val = acc  # already computed from OOF
+        prec_val_m = prec_val
+        rec_val_m = rec_val
+        f1_val = f1_val_oof
+        auc_val = auc_oof
+    else:
+        acc_val = accuracy_score(y_test, y_pred)
+        prec_val_m = precision_score(y_test, y_pred, zero_division=0)
+        rec_val_m = recall_score(y_test, y_pred, zero_division=0)
+        f1_val = f1_score(y_test, y_pred, zero_division=0)
+        auc_val = roc_auc_score(y_test, y_proba_test)
     cm = confusion_matrix(y_test, y_pred)
 
     # Full dataset predictions
@@ -815,11 +859,11 @@ def stage4_model(df, feature_cols):
     total_legit = int((~df['is_fraud'].astype(bool)).sum())
 
     metrics = {
-        "accuracy": round(float(acc), 4),
-        "precision": round(float(prec), 4),
-        "recall": round(float(rec), 4),
+        "accuracy": round(float(acc_val), 4),
+        "precision": round(float(prec_val_m), 4),
+        "recall": round(float(rec_val_m), 4),
         "f1_score": round(float(f1_val), 4),
-        "auc_roc": round(float(auc), 4),
+        "auc_roc": round(float(auc_val), 4),
         "total_fraud_detected": total_fraud,
         "total_legitimate": total_legit,
         "false_positives": int(cm[0][1]),
