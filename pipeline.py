@@ -651,9 +651,9 @@ def stage4_model(df, feature_cols):
             X_gt, y_gt, test_size=0.2, random_state=42, stratify=y_gt
         )
 
-        # SMOTE for the extreme imbalance (0.84% fraud)
+        # SMOTE for extreme imbalance — aggressive oversampling needed
         fraud_ratio = y_train.sum() / len(y_train)
-        smote_ratio = min(0.3, max(fraud_ratio * 5, 0.1))  # conservative oversampling
+        smote_ratio = min(0.5, max(fraud_ratio * 20, 0.2))  # 20x oversample, cap at 50%
         try:
             smote = SMOTE(random_state=42, sampling_strategy=smote_ratio)
             X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
