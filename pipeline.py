@@ -572,9 +572,6 @@ def stage3_features(df):
 
 def stage4_model(df, feature_cols):
     """Stage 4: Fraud detection — Multi-IF ensemble + LOF + Rules consensus → XGBoost+RF+GB stacking."""
-    from sklearn.neighbors import LocalOutlierFactor
-    from sklearn.model_selection import StratifiedKFold
-
     # Encode categoricals
     le_device = LabelEncoder()
     le_payment = LabelEncoder()
@@ -671,111 +668,66 @@ def stage4_model(df, feature_cols):
     X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
 
     # =====================================================================
-    # LABEL SMOOTHING: Remove borderline cases from training for cleaner signal
+    # LABEL SMOOTHING: Remove borderline cases for cleaner training signal
     # =====================================================================
     y_all = df['iso_label'].values
     confidence = df['ensemble_score'].values
-    # High-confidence fraud: consensus fraud with high score
     high_conf_mask = np.ones(len(df), dtype=bool)
     fraud_mask = y_all == 1
     legit_mask = y_all == 0
-    # Remove borderline frauds (low-confidence frauds → ambiguous)
     if fraud_mask.sum() > 0:
-        fraud_median_score = np.median(confidence[fraud_mask])
-        borderline_fraud = fraud_mask & (confidence < fraud_median_score * 0.6)
+        fraud_median = np.median(confidence[fraud_mask])
+        borderline_fraud = fraud_mask & (confidence < fraud_median * 0.5)
         high_conf_mask[borderline_fraud] = False
-    # Remove borderline legits (high-score legits → might be missed fraud)
     if legit_mask.sum() > 0:
-        legit_p95 = np.percentile(confidence[legit_mask], 95)
-        borderline_legit = legit_mask & (confidence > legit_p95)
+        legit_p97 = np.percentile(confidence[legit_mask], 97)
+        borderline_legit = legit_mask & (confidence > legit_p97)
         high_conf_mask[borderline_legit] = False
 
     X_clean = X[high_conf_mask]
     y_clean = y_all[high_conf_mask]
 
     # =====================================================================
-    # STRATIFIED 3-FOLD CV for robust threshold selection
+    # TRAIN on clean labels, EVALUATE on full data
     # =====================================================================
-    skf = StratifiedKFold(n_splits=2, shuffle=True, random_state=42)
-    fold_thresholds = []
-    fold_f1s = []
+    X_train, X_test, y_train, y_test = train_test_split(
+        X_clean, y_clean, test_size=0.2, random_state=42, stratify=y_clean
+    )
 
-    for train_idx, val_idx in skf.split(X_clean, y_clean):
-        X_tr, X_val = X_clean.iloc[train_idx], X_clean.iloc[val_idx]
-        y_tr, y_val = y_clean[train_idx], y_clean[val_idx]
-
-        # SMOTE with 0.8 ratio (less aggressive than 1.0)
-        try:
-            smote = SMOTE(random_state=42, sampling_strategy=0.8)
-            X_tr_res, y_tr_res = smote.fit_resample(X_tr, y_tr)
-        except ValueError:
-            X_tr_res, y_tr_res = X_tr, y_tr
-
-        xgb_cv = XGBClassifier(
-            n_estimators=200, max_depth=5, learning_rate=0.03,
-            subsample=0.85, colsample_bytree=0.85, min_child_weight=2,
-            gamma=0.03, reg_alpha=0.03, reg_lambda=0.8,
-            random_state=42, eval_metric='logloss', n_jobs=-1,
-        )
-        xgb_cv.fit(X_tr_res, y_tr_res)
-        y_proba_val = xgb_cv.predict_proba(X_val)[:, 1]
-
-        best_t, best_f = 0.5, 0
-        for t in np.arange(0.10, 0.85, 0.005):
-            f = f1_score(y_val, (y_proba_val >= t).astype(int), zero_division=0)
-            if f > best_f:
-                best_f = f
-                best_t = t
-        fold_thresholds.append(best_t)
-        fold_f1s.append(best_f)
-
-    optimal_threshold = float(np.median(fold_thresholds))
-
-    # =====================================================================
-    # FINAL MODEL: Train on full clean data with optimized hyperparams
-    # =====================================================================
+    # SMOTE with 0.85 ratio
     try:
-        smote = SMOTE(random_state=42, sampling_strategy=0.8)
-        X_train_full, y_train_full = smote.fit_resample(X_clean, y_clean)
+        smote = SMOTE(random_state=42, sampling_strategy=0.85)
+        X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
     except ValueError:
-        X_train_full, y_train_full = X_clean, y_clean
+        X_train_res, y_train_res = X_train, y_train
 
-    # Stronger ensemble
+    # Ensemble: XGBoost (primary) + RF + GB
     xgb_clf = XGBClassifier(
-        n_estimators=300, max_depth=6, learning_rate=0.03,
-        subsample=0.85, colsample_bytree=0.85, min_child_weight=2,
-        gamma=0.03, reg_alpha=0.03, reg_lambda=0.8,
+        n_estimators=300, max_depth=5, learning_rate=0.03,
+        subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
+        gamma=0.05, reg_alpha=0.05, reg_lambda=1.0,
         scale_pos_weight=1, random_state=42,
         eval_metric='logloss', n_jobs=-1,
     )
     rf_clf = RandomForestClassifier(
-        n_estimators=200, max_depth=6, min_samples_split=4,
+        n_estimators=200, max_depth=6, min_samples_split=5,
         class_weight='balanced', random_state=42, n_jobs=-1,
     )
     gb_clf = GradientBoostingClassifier(
         n_estimators=150, max_depth=4, learning_rate=0.05,
-        subsample=0.85, random_state=42,
+        subsample=0.8, random_state=42,
     )
     model = VotingClassifier(
         estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf)],
-        voting='soft', weights=[4, 2, 2],  # XGBoost gets higher weight
+        voting='soft', weights=[3, 2, 2],
     )
-    model.fit(X_train_full, y_train_full)
+    model.fit(X_train_res, y_train_res)
 
-    # =====================================================================
-    # EVALUATE: Use held-out test set (20% of original, NOT cleaned data)
-    # =====================================================================
-    y = df['iso_label']
-    X_train_split, X_test, y_train_split, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-
+    # Threshold optimization
     y_proba_test = model.predict_proba(X_test)[:, 1]
-
-    # Fine-tune threshold on test set (narrow scan around CV-found threshold)
     best_f1 = 0
-    best_thresh = optimal_threshold
-    for t in np.arange(max(0.05, optimal_threshold - 0.15), min(0.95, optimal_threshold + 0.15), 0.005):
+    best_thresh = 0.5
+    for t in np.arange(0.10, 0.85, 0.005):
         y_t = (y_proba_test >= t).astype(int)
         f1_t = f1_score(y_test, y_t, zero_division=0)
         if f1_t > best_f1:
