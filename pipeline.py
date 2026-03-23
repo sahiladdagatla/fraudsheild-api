@@ -690,20 +690,20 @@ def stage4_model(df, feature_cols):
     rule_scores += df['nighttime'] * 0.04
     rule_scores += (df['cross_user_device'] == 1).astype(float) * 0.05
     rule_scores += (df['time_since_last_txn'] < 60).astype(float) * (df['time_since_last_txn'] > 0).astype(float) * 0.06
-    rule_flags = (rule_scores >= 0.30).astype(int)
+    rule_flags = (rule_scores >= 0.35).astype(int)
 
     # Consensus: flagged if >=2 of 3 methods agree (stricter = cleaner labels)
     vote_count = iso_flags + lof_flags + rule_flags
     consensus_fraud = (vote_count >= 2).astype(int)
 
-    # Also include very high-confidence single-method detections
-    strong_iso = (iso_norm > np.percentile(iso_norm, 97)).astype(int)
-    strong_lof = (lof_norm > np.percentile(lof_norm, 97)).astype(int)
-    strong_rule = (rule_scores >= 0.55).astype(int)
-    strong_single = ((strong_iso + strong_lof + strong_rule) >= 1).astype(int)
+    # Only include very high-confidence single-method detections (stricter)
+    strong_iso = (iso_norm > np.percentile(iso_norm, 98)).astype(int)
+    strong_rule = (rule_scores >= 0.60).astype(int)
+    # Need 2+ strong single-method signals (not just 1)
+    strong_single = ((strong_iso + strong_rule) >= 2).astype(int)
 
     df['iso_label'] = ((consensus_fraud == 1) | (strong_single == 1)).astype(int)
-    df['ensemble_score'] = 0.35 * iso_norm + 0.30 * lof_norm + 0.35 * rule_scores
+    df['ensemble_score'] = 0.40 * iso_norm + 0.20 * lof_norm + 0.40 * rule_scores
 
     # Update category_risk_score with actual fraud rates
     cat_fraud_rate = df.groupby('merchant_category')['iso_label'].mean().to_dict()
