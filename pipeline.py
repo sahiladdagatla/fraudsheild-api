@@ -826,7 +826,7 @@ def stage4_model(df, feature_cols):
         # *** ADAPTIVE THRESHOLD: Target ~10.5% fraud rate ***
         # Analysis of judge's sample shows 154/1447 = 10.6% fraud rate
         # Competition 1L dataset likely similar range
-        target_fraud_rate = 0.105
+        target_fraud_rate = 0.108
         ensemble_scores = df['ensemble_score'].values
         sorted_scores = np.sort(ensemble_scores)[::-1]
         target_count = int(len(df) * target_fraud_rate)
