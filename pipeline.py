@@ -622,10 +622,10 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
     X_gt = X[valid_labels]
 
     # For large datasets, subsample for CV/training
-    if is_large and len(X_gt) > 30000:
+    if is_large and len(X_gt) > 20000:
         fraud_idx = np.where(y_gt == 1)[0]
         legit_idx = np.where(y_gt == 0)[0]
-        n_legit = min(25000, len(legit_idx))
+        n_legit = min(15000, len(legit_idx))
         legit_sample = np.random.RandomState(42).choice(legit_idx, n_legit, replace=False)
         sample_idx = np.concatenate([fraud_idx, legit_sample])
         np.random.RandomState(42).shuffle(sample_idx)
@@ -643,9 +643,9 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
     cv_results = {'f1': [], 'precision': [], 'recall': [], 'accuracy': [], 'auc': []}
 
-    n_est_xgb = 200 if is_large else 500
-    n_est_rf = 150 if is_large else 300
-    n_est_gb = 100 if is_large else 200
+    n_est_xgb = 150 if is_large else 400
+    n_est_rf = 100 if is_large else 250
+    n_est_gb = 80 if is_large else 150
 
     xgb_clf = XGBClassifier(
         n_estimators=n_est_xgb, max_depth=6, learning_rate=0.02,
@@ -678,14 +678,14 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
         fold_model.fit(X_tr, y_tr)
         y_proba_val = fold_model.predict_proba(X_val)[:, 1]
 
-        # Find best threshold for this fold
-        best_f1_fold = 0
-        best_t = 0.5
-        for t in np.arange(0.05, 0.85, 0.005):
+        # Find best threshold for this fold (optimize F2 = recall-weighted)
+        best_f2_fold = 0
+        best_t = 0.3
+        for t in np.arange(0.05, 0.70, 0.005):
             y_t = (y_proba_val >= t).astype(int)
-            f = f1_score(y_val, y_t, zero_division=0)
-            if f > best_f1_fold:
-                best_f1_fold = f
+            f = fbeta_score(y_val, y_t, beta=2, zero_division=0)
+            if f > best_f2_fold:
+                best_f2_fold = f
                 best_t = t
 
         y_pred_val = (y_proba_val >= best_t).astype(int)
@@ -765,21 +765,21 @@ def _unsupervised_model(df, X, all_features):
 
     # For large datasets, subsample for IF training but score all rows
     if is_large:
-        sample_size = min(20000, n_samples)
+        sample_size = min(15000, n_samples)
         sample_idx = np.random.RandomState(42).choice(n_samples, sample_size, replace=False)
         X_sample = X.iloc[sample_idx]
     else:
         X_sample = X
 
     # === METHOD 1: Multi-contamination Isolation Forest ensemble ===
-    contaminations = [0.08, 0.10, 0.12] if is_large else [0.08, 0.10, 0.12, 0.15, 0.18]
-    n_estimators_if = 100 if is_large else 200
+    contaminations = [0.08, 0.10, 0.12] if is_large else [0.08, 0.10, 0.12, 0.15]
+    n_estimators_if = 80 if is_large else 150
     iso_score_sum = np.zeros(n_samples)
     iso_vote_sum = np.zeros(n_samples)
     for cont in contaminations:
         iso = IsolationForest(
             n_estimators=n_estimators_if, contamination=cont,
-            max_samples=min(8000 if is_large else 15000, len(X_sample)),
+            max_samples=min(5000 if is_large else 10000, len(X_sample)),
             random_state=42, n_jobs=-1
         )
         iso.fit(X_sample)
@@ -917,11 +917,11 @@ def _unsupervised_model(df, X, all_features):
     y_clean = y_all[high_conf_mask]
 
     # For large datasets, subsample training data to fit in memory
-    if is_large and len(X_clean) > 25000:
+    if is_large and len(X_clean) > 15000:
         # Keep all fraud + subsample legitimate
         fraud_idx = np.where(y_clean == 1)[0]
         legit_idx = np.where(y_clean == 0)[0]
-        n_legit_sample = min(20000, len(legit_idx))
+        n_legit_sample = min(12000, len(legit_idx))
         legit_sample = np.random.RandomState(42).choice(legit_idx, n_legit_sample, replace=False)
         train_idx = np.concatenate([fraud_idx, legit_sample])
         X_clean = X_clean.iloc[train_idx]
@@ -945,9 +945,9 @@ def _unsupervised_model(df, X, all_features):
     fraud_ratio = max(y_train.mean(), 0.01)
     pos_weight = max(1, int((1 - fraud_ratio) / fraud_ratio))
 
-    n_est_xgb = 150 if is_large else 300
-    n_est_rf = 100 if is_large else 200
-    n_est_gb = 80 if is_large else 150
+    n_est_xgb = 100 if is_large else 300
+    n_est_rf = 80 if is_large else 200
+    n_est_gb = 60 if is_large else 150
 
     xgb_clf = XGBClassifier(
         n_estimators=n_est_xgb, max_depth=5, learning_rate=0.03,
@@ -976,13 +976,14 @@ def _unsupervised_model(df, X, all_features):
 
     # Predict on test set for metrics
     y_proba_test = model.predict_proba(X_test)[:, 1]
-    best_f1 = 0
-    best_thresh = 0.5
-    for t in np.arange(0.05, 0.85, 0.005):
+    # Optimize for F2 score (weights recall 2x more than precision)
+    best_f2 = 0
+    best_thresh = 0.3  # Default lower threshold to catch more fraud
+    for t in np.arange(0.05, 0.70, 0.005):
         y_t = (y_proba_test >= t).astype(int)
-        f = f1_score(y_test, y_t, zero_division=0)
-        if f > best_f1:
-            best_f1 = f
+        f = fbeta_score(y_test, y_t, beta=2, zero_division=0)
+        if f > best_f2:
+            best_f2 = f
             best_thresh = t
 
     y_pred_test = (y_proba_test >= best_thresh).astype(int)
