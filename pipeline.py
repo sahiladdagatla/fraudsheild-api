@@ -519,7 +519,7 @@ def stage3_features(df):
 
     # amount_zscore per user (vectorized groupby/transform)
     df['amount_zscore'] = df.groupby('user_id')['transaction_amount'].transform(
-        lambda x: (x - x.mean()) / x.std().clip(lower=1)
+        lambda x: (x - x.mean()) / max(x.std(), 1) if len(x) > 1 else 0
     ).fillna(0)
 
     # txn_velocity_1h: use rolling count on timestamp index per user
