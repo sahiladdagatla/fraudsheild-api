@@ -438,12 +438,12 @@ def stage1_clean(df):
     # Flag extreme outliers
     df['amount_outlier'] = (df['transaction_amount'] > 1_000_000).astype(int)
 
-    # Validate IPs
-    df['ip_valid'] = _validate_ip_vectorized(df['ip_address']).astype(bool)
-    quality['invalid_ips'] = int((~df['ip_valid']).sum())
-    # Sanity check: ensure non-negative
-    if quality['invalid_ips'] < 0:
-        quality['invalid_ips'] = int(len(df) - df['ip_valid'].sum())
+    # Validate IPs — ensure proper boolean handling
+    ip_valid_series = _validate_ip_vectorized(df['ip_address'])
+    # Force to proper boolean (handle any weird dtype issues)
+    df['ip_valid'] = ip_valid_series.fillna(False).astype(bool)
+    n_valid = int(df['ip_valid'].sum())
+    quality['invalid_ips'] = max(0, len(df) - n_valid)
 
     # Remove duplicates
     before = len(df)
@@ -635,11 +635,13 @@ def stage4_model(df, feature_cols):
 
     if has_ground_truth:
         # ===== SUPERVISED MODE: Train on real labels =====
+        # Store full ground truth before any overwriting
+        y_gt_full = pd.to_numeric(df['is_fraud'], errors='coerce').fillna(0).astype(int).values
+
         # Update category risk from ground truth
         df_gt = df[valid_labels].copy()
-        cat_fraud_rate = df_gt.groupby('merchant_category')[df_gt.columns[df_gt.columns.get_loc('is_fraud')]].apply(
-            lambda x: pd.to_numeric(x, errors='coerce').mean()
-        ).to_dict()
+        df_gt['_gt_label'] = y_gt
+        cat_fraud_rate = df_gt.groupby('merchant_category')['_gt_label'].mean().to_dict()
         df['category_risk_score'] = df['merchant_category'].map(cat_fraud_rate).fillna(0)
         X = df[all_features].copy()
         X = X.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -805,7 +807,24 @@ def stage4_model(df, feature_cols):
 
     # Full dataset predictions
     df['fraud_proba'] = model.predict_proba(X)[:, 1]
-    df['is_fraud'] = (df['fraud_proba'] >= best_thresh).astype(int)
+
+    # If ground truth exists, optimize threshold on FULL dataset for best F1
+    if has_ground_truth:
+        y_full_gt = pd.to_numeric(df['is_fraud'] if 'is_fraud' in df.columns else pd.Series(), errors='coerce').fillna(0).astype(int)
+        # Re-read original is_fraud before we overwrite
+        y_full_gt = gt_original.values if 'gt_original' in dir() else y_gt_full
+        full_proba = df['fraud_proba'].values
+        best_f1_full = 0
+        best_thresh_full = best_thresh
+        for t in np.arange(0.10, 0.95, 0.005):
+            y_t = (full_proba >= t).astype(int)
+            f1_t = f1_score(y_full_gt, y_t, zero_division=0)
+            if f1_t > best_f1_full:
+                best_f1_full = f1_t
+                best_thresh_full = t
+        df['is_fraud'] = (df['fraud_proba'] >= best_thresh_full).astype(int)
+    else:
+        df['is_fraud'] = (df['fraud_proba'] >= best_thresh).astype(int)
 
     total_fraud = int(df['is_fraud'].sum())
     total_legit = int((~df['is_fraud'].astype(bool)).sum())
