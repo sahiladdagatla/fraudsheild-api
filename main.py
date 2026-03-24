@@ -45,6 +45,7 @@ def health():
 @app.post("/api/analyze")
 async def analyze_csv(request: Request):
     """Accept raw CSV text in POST body and run the fraud detection pipeline."""
+    import asyncio
     body = await request.body()
     csv_text = body.decode("utf-8")
 
@@ -54,7 +55,8 @@ async def analyze_csv(request: Request):
     if len(csv_text) > 50 * 1024 * 1024:  # 50MB limit
         return JSONResponse(status_code=413, content={"error": "CSV exceeds 50MB limit"})
 
-    result = process_csv(csv_text)
+    # Run pipeline in thread pool to avoid blocking the event loop
+    result = await asyncio.to_thread(process_csv, csv_text)
 
     if "error" in result:
         return JSONResponse(status_code=500, content=result)

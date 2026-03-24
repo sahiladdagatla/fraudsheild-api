@@ -336,16 +336,27 @@ def stage1_clean(df):
     # Normalize locations
     orig_user = df['user_location'].dropna().nunique()
     orig_merch = df['merchant_location'].dropna().nunique()
-    df['user_location'] = df['user_location'].apply(_normalize_city_scalar)
-    df['merchant_location'] = df['merchant_location'].apply(_normalize_city_scalar)
+    # Vectorized: build lookup from unique values then map
+    _ul_uniq = df['user_location'].dropna().unique()
+    _ul_map = {v: _normalize_city_scalar(v) for v in _ul_uniq}
+    df['user_location'] = df['user_location'].map(_ul_map)
+    _ml_uniq = df['merchant_location'].dropna().unique()
+    _ml_map = {v: _normalize_city_scalar(v) for v in _ml_uniq}
+    df['merchant_location'] = df['merchant_location'].map(_ml_map)
     new_user = df['user_location'].dropna().nunique()
     new_merch = df['merchant_location'].dropna().nunique()
     quality['location_variants_normalized'] = max((orig_user - new_user) + (orig_merch - new_merch), 0)
 
     # Normalize categories, device, payment, status
-    df['merchant_category'] = df['merchant_category'].apply(_normalize_category_scalar)
-    df['device_type'] = df['device_type'].apply(_normalize_device_scalar)
-    df['payment_method'] = df['payment_method'].apply(_normalize_payment_scalar)
+    _mc_uniq = df['merchant_category'].dropna().unique()
+    _mc_map = {v: _normalize_category_scalar(v) for v in _mc_uniq}
+    df['merchant_category'] = df['merchant_category'].map(_mc_map).fillna('Unknown')
+    _dt_uniq = df['device_type'].dropna().unique()
+    _dt_map = {v: _normalize_device_scalar(v) for v in _dt_uniq}
+    df['device_type'] = df['device_type'].map(_dt_map).fillna('Unknown')
+    _pm_uniq = df['payment_method'].dropna().unique()
+    _pm_map = {v: _normalize_payment_scalar(v) for v in _pm_uniq}
+    df['payment_method'] = df['payment_method'].map(_pm_map).fillna('Unknown')
     if 'transaction_status' in df.columns:
         df['transaction_status'] = df['transaction_status'].apply(_normalize_status_scalar)
 
@@ -681,7 +692,7 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
         # Find best threshold for this fold (optimize F2 = recall-weighted)
         best_f2_fold = 0
         best_t = 0.3
-        for t in np.arange(0.05, 0.70, 0.005):
+        for t in np.arange(0.05, 0.70, 0.02):
             y_t = (y_proba_val >= t).astype(int)
             f = fbeta_score(y_val, y_t, beta=2, zero_division=0)
             if f > best_f2_fold:
@@ -772,8 +783,8 @@ def _unsupervised_model(df, X, all_features):
         X_sample = X
 
     # === METHOD 1: Multi-contamination Isolation Forest ensemble ===
-    contaminations = [0.08, 0.10, 0.12] if is_large else [0.08, 0.10, 0.12, 0.15]
-    n_estimators_if = 80 if is_large else 150
+    contaminations = [0.08, 0.12] if is_large else [0.08, 0.10, 0.12]
+    n_estimators_if = 50 if is_large else 80
     iso_score_sum = np.zeros(n_samples)
     iso_vote_sum = np.zeros(n_samples)
     for cont in contaminations:
@@ -954,9 +965,9 @@ def _unsupervised_model(df, X, all_features):
     fraud_ratio = max(y_train.mean(), 0.01)
     pos_weight = max(1, int((1 - fraud_ratio) / fraud_ratio))
 
-    n_est_xgb = 100 if is_large else 300
-    n_est_rf = 80 if is_large else 200
-    n_est_gb = 60 if is_large else 150
+    n_est_xgb = 80 if is_large else 150
+    n_est_rf = 50 if is_large else 100
+    n_est_gb = 40 if is_large else 80
 
     xgb_clf = XGBClassifier(
         n_estimators=n_est_xgb, max_depth=5, learning_rate=0.03,
@@ -988,7 +999,7 @@ def _unsupervised_model(df, X, all_features):
     # Optimize for F2 score (weights recall 2x more than precision)
     best_f2 = 0
     best_thresh = 0.3  # Default lower threshold to catch more fraud
-    for t in np.arange(0.05, 0.70, 0.005):
+    for t in np.arange(0.05, 0.70, 0.02):
         y_t = (y_proba_test >= t).astype(int)
         f = fbeta_score(y_test, y_t, beta=2, zero_division=0)
         if f > best_f2:
