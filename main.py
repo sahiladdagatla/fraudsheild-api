@@ -10,14 +10,22 @@ import uvicorn
 
 from pipeline import run_pipeline as _run_pipeline
 import traceback
+import gc
+import logging
+
+logging.basicConfig(level=logging.WARNING)
 
 # Build tag: v4-ridge-468 — forces Railway to restart fresh process
 
 def process_csv(csv_text):
-    """Wrapper with error handling."""
+    """Wrapper with error handling and memory cleanup."""
     try:
-        return _run_pipeline(csv_text)
+        result = _run_pipeline(csv_text)
+        gc.collect()
+        return result
     except Exception as e:
+        gc.collect()
+        logging.error(f"Pipeline error: {e}\n{traceback.format_exc()}")
         return {"error": str(e), "traceback": traceback.format_exc()}
 
 app = FastAPI(
@@ -59,7 +67,18 @@ async def analyze_csv(request: Request):
     if "error" in result:
         return JSONResponse(status_code=500, content=result)
 
-    return JSONResponse(content=result)
+    # Replace NaN/Inf with None for JSON compliance
+    import math
+    def sanitize(obj):
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return None
+        if isinstance(obj, dict):
+            return {k: sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [sanitize(v) for v in obj]
+        return obj
+
+    return JSONResponse(content=sanitize(result))
 
 
 @app.post("/api/analyze-file")
