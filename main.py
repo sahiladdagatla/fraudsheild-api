@@ -20,8 +20,6 @@ except ImportError:
 import uvicorn
 
 from pipeline import run_pipeline as _run_pipeline
-import hashlib
-from functools import lru_cache
 
 # Pre-import heavy libraries at module load (not per-request)
 import numpy as np
@@ -29,24 +27,10 @@ import pandas as pd
 import sklearn
 import xgboost
 
-# Simple in-memory cache: hash(CSV) → result (max 3 entries)
-_cache = {}
-_CACHE_MAX = 3
-
 def process_csv(csv_text):
-    """Wrapper with caching, error handling, and memory cleanup."""
-    # Check cache first — same CSV = instant response
-    csv_hash = hashlib.md5(csv_text.encode()).hexdigest()
-    if csv_hash in _cache:
-        return _cache[csv_hash]
-
+    """Run pipeline fresh every time — no caching, max accuracy."""
     try:
         result = _run_pipeline(csv_text)
-        # Cache result (evict oldest if full)
-        if len(_cache) >= _CACHE_MAX:
-            oldest = next(iter(_cache))
-            del _cache[oldest]
-        _cache[csv_hash] = result
         gc.collect()
         return result
     except Exception as e:
