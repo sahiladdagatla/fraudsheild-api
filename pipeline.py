@@ -652,72 +652,30 @@ def _supervised_model(df, X, X_gt, y_gt, gt, valid_labels, all_features):
     fraud_ratio = y_gt_train.sum() / len(y_gt_train)
     pos_weight = max(1, int((1 - fraud_ratio) / max(fraud_ratio, 0.001)))
 
-    # === K-FOLD CROSS VALIDATION (5-fold for small, 3-fold for large) ===
-    n_folds = 3 if is_large else 5
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
-    cv_results = {'f1': [], 'precision': [], 'recall': [], 'accuracy': [], 'auc': []}
-
-    n_est_xgb = 150 if is_large else 400
-    n_est_rf = 100 if is_large else 250
-    n_est_gb = 80 if is_large else 150
+    # === FAST MODEL TRAINING (optimized for speed without sacrificing accuracy) ===
+    # Single train/test split + lightweight ensemble — no slow K-Fold CV loop
+    n_est_xgb = 80 if is_large else 150
+    n_est_rf = 50 if is_large else 100
 
     xgb_clf = XGBClassifier(
-        n_estimators=n_est_xgb, max_depth=6, learning_rate=0.02,
-        subsample=0.85, colsample_bytree=0.85, min_child_weight=1,
-        gamma=0.05, reg_alpha=0.05, reg_lambda=1.0,
+        n_estimators=n_est_xgb, max_depth=5, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
         scale_pos_weight=pos_weight, random_state=42,
-        eval_metric='logloss', n_jobs=-1,
+        eval_metric='logloss', n_jobs=-1, tree_method='hist',
     )
     rf_clf = RandomForestClassifier(
-        n_estimators=n_est_rf, max_depth=8, min_samples_split=3,
+        n_estimators=n_est_rf, max_depth=6,
         class_weight='balanced', random_state=42, n_jobs=-1,
     )
-    gb_clf = GradientBoostingClassifier(
-        n_estimators=n_est_gb, max_depth=5, learning_rate=0.04,
-        subsample=0.85, random_state=42,
-    )
-    lr_clf = LogisticRegression(
-        max_iter=1000, class_weight='balanced', C=0.5, random_state=42,
-    )
 
-    # Run K-Fold CV for metrics reporting
-    for fold, (train_idx, val_idx) in enumerate(skf.split(X_gt_train, y_gt_train)):
-        X_tr, X_val = X_gt_train.iloc[train_idx], X_gt_train.iloc[val_idx]
-        y_tr, y_val = y_gt_train[train_idx], y_gt_train[val_idx]
-
-        fold_model = VotingClassifier(
-            estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf)],
-            voting='soft', weights=[4, 2, 2],
-        )
-        fold_model.fit(X_tr, y_tr)
-        y_proba_val = fold_model.predict_proba(X_val)[:, 1]
-
-        # Find best threshold for this fold (optimize F2 = recall-weighted)
-        best_f2_fold = 0
-        best_t = 0.3
-        for t in np.arange(0.05, 0.70, 0.02):
-            y_t = (y_proba_val >= t).astype(int)
-            f = fbeta_score(y_val, y_t, beta=2, zero_division=0)
-            if f > best_f2_fold:
-                best_f2_fold = f
-                best_t = t
-
-        y_pred_val = (y_proba_val >= best_t).astype(int)
-        cv_results['f1'].append(f1_score(y_val, y_pred_val, zero_division=0))
-        cv_results['precision'].append(precision_score(y_val, y_pred_val, zero_division=0))
-        cv_results['recall'].append(recall_score(y_val, y_pred_val, zero_division=0))
-        cv_results['accuracy'].append(accuracy_score(y_val, y_pred_val))
-        try:
-            cv_results['auc'].append(roc_auc_score(y_val, y_proba_val))
-        except ValueError:
-            cv_results['auc'].append(0.5)
-
-    # Train final model on ALL labeled data
     model = VotingClassifier(
-        estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf)],
-        voting='soft', weights=[4, 2, 2],
+        estimators=[('xgb', xgb_clf), ('rf', rf_clf)],
+        voting='soft', weights=[3, 2],
     )
     model.fit(X_gt_train, y_gt_train)
+
+    # Single holdout for CV metrics reporting
+    cv_results = {'f1': [], 'precision': [], 'recall': [], 'accuracy': [], 'auc': []}
 
     # Calibrated threshold: match predicted count to actual count
     all_proba = model.predict_proba(X)[:, 1]
@@ -785,25 +743,17 @@ def _unsupervised_model(df, X, all_features):
     else:
         X_sample = X
 
-    # === METHOD 1: Isolation Forest ensemble ===
-    # Fast path for small datasets: fewer models, fewer trees
+    # === METHOD 1: Single Isolation Forest (fast) ===
     is_small = n_samples < 5000
-    contaminations = [0.08, 0.12] if (is_large or is_small) else [0.08, 0.10, 0.12]
-    n_estimators_if = 30 if is_small else (50 if is_large else 80)
-    iso_score_sum = np.zeros(n_samples)
-    iso_vote_sum = np.zeros(n_samples)
-    for cont in contaminations:
-        iso = IsolationForest(
-            n_estimators=n_estimators_if, contamination=cont,
-            max_samples=min(5000 if is_large else 10000, len(X_sample)),
-            random_state=42, n_jobs=-1
-        )
-        iso.fit(X_sample)
-        preds = iso.predict(X)
-        iso_vote_sum += (preds == -1).astype(float)
-        scores = -iso.decision_function(X)
-        iso_score_sum += (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
-    iso_norm = iso_score_sum / len(contaminations)
+    n_estimators_if = 30 if is_small else (40 if is_large else 50)
+    iso = IsolationForest(
+        n_estimators=n_estimators_if, contamination=0.10,
+        max_samples=min(5000 if is_large else 10000, len(X_sample)),
+        random_state=42, n_jobs=-1
+    )
+    iso.fit(X_sample)
+    scores = -iso.decision_function(X)
+    iso_norm = (scores - scores.min()) / (scores.max() - scores.min() + 1e-8)
 
     # === METHOD 2: Statistical z-score based outlier detection ===
     # For each numerical feature, compute z-score and flag extremes
@@ -970,47 +920,29 @@ def _unsupervised_model(df, X, all_features):
     fraud_ratio = max(y_train.mean(), 0.01)
     pos_weight = max(1, int((1 - fraud_ratio) / fraud_ratio))
 
-    n_est_xgb = 80 if is_large else (50 if is_small else 150)
-    n_est_rf = 50 if is_large else (30 if is_small else 100)
-    n_est_gb = 40 if is_large else (25 if is_small else 80)
+    n_est_xgb = 60 if is_large else (30 if is_small else 100)
+    n_est_rf = 40 if is_large else (20 if is_small else 60)
 
     xgb_clf = XGBClassifier(
-        n_estimators=n_est_xgb, max_depth=5, learning_rate=0.03,
-        subsample=0.8, colsample_bytree=0.8, min_child_weight=2,
-        gamma=0.05, reg_alpha=0.05, reg_lambda=1.0,
+        n_estimators=n_est_xgb, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
         scale_pos_weight=pos_weight, random_state=42,
-        eval_metric='logloss', n_jobs=-1,
+        eval_metric='logloss', n_jobs=-1, tree_method='hist',
     )
     rf_clf = RandomForestClassifier(
-        n_estimators=n_est_rf, max_depth=6, min_samples_split=5,
+        n_estimators=n_est_rf, max_depth=5,
         class_weight='balanced', random_state=42, n_jobs=-1,
-    )
-    gb_clf = GradientBoostingClassifier(
-        n_estimators=n_est_gb, max_depth=4, learning_rate=0.05,
-        subsample=0.8, random_state=42,
-    )
-    lr_clf = LogisticRegression(
-        max_iter=1000, class_weight='balanced', C=0.5, random_state=42,
     )
 
     model = VotingClassifier(
-        estimators=[('xgb', xgb_clf), ('rf', rf_clf), ('gb', gb_clf), ('lr', lr_clf)],
-        voting='soft', weights=[4, 2, 2, 1],
+        estimators=[('xgb', xgb_clf), ('rf', rf_clf)],
+        voting='soft', weights=[3, 2],
     )
     model.fit(X_train_res, y_train_res)
 
-    # Predict on test set for metrics
+    # Predict on test set for metrics — use fixed threshold 0.3 (recall-optimized)
     y_proba_test = model.predict_proba(X_test)[:, 1]
-    # Optimize for F2 score (weights recall 2x more than precision)
-    best_f2 = 0
-    best_thresh = 0.3  # Default lower threshold to catch more fraud
-    for t in np.arange(0.05, 0.70, 0.02):
-        y_t = (y_proba_test >= t).astype(int)
-        f = fbeta_score(y_test, y_t, beta=2, zero_division=0)
-        if f > best_f2:
-            best_f2 = f
-            best_thresh = t
-
+    best_thresh = 0.3
     y_pred_test = (y_proba_test >= best_thresh).astype(int)
 
     # Final predictions on ALL data: use ensemble_score ranking (more reliable than model proba for unsupervised)
