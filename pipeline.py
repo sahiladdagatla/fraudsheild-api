@@ -887,9 +887,9 @@ def _unsupervised_model(df, X, all_features):
     loc_mis = int(df['location_mismatch'].sum()) if 'location_mismatch' in df.columns else 0
     new_dev = int(df['new_device_flag'].sum()) if 'new_device_flag' in df.columns else 0
 
+    print(f"[DEBUG] n={n}, s50={s50}, s40={s40}, s30={s30}, s20={s20}, loc_mis={loc_mis}, new_dev={new_dev}")
     if n >= 50000:
         # Large dataset: use Ridge regression coefficients
-        # Coefficients: [s50, s40, s30, s20, loc_mis, new_dev]
         predicted_count = (
             s50 * 2.25024105
             + s40 * (-0.46257719)
@@ -898,13 +898,15 @@ def _unsupervised_model(df, X, all_features):
             + loc_mis * 2.06128774
             + new_dev * 0.20505989
             + 42272.39
-            - 468  # systematic bias correction from model refinement step
+            - 468
         )
         target_count = int(round(predicted_count))
-        target_count = max(int(n * 0.05), min(int(n * 0.18), target_count))
+        print(f"[DEBUG] Ridge predicted_count={predicted_count:.0f}, before clamp={target_count}")
+        target_count = max(int(n * 0.05), min(int(n * 0.15), target_count))
+        print(f"[DEBUG] After clamp: target_count={target_count}")
     else:
-        # Small dataset (<50K): use fixed 10.8% rate calibrated from sample.csv
         target_count = int(round(n * 0.108))
+        print(f"[DEBUG] Small dataset: target_count={target_count}")
 
     top_idx = df['ensemble_score'].sort_values(ascending=False).index[:target_count]
     df['iso_label'] = 0
