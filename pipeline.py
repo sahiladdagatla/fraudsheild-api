@@ -307,9 +307,10 @@ def stage1_clean(df):
         "amt_shadow_column_merged": 0,
     }
 
-    # Standardize missing values
+    # Standardize missing values — check lowercase against NA_VALUES set
     for col in df.select_dtypes(include=['object']).columns:
-        df[col] = _standardize_missing(df[col])
+        mask = df[col].astype(str).str.strip().str.lower().isin(NA_VALUES)
+        df.loc[mask, col] = np.nan
 
     # Merge shadow amt column
     shadow_merged = 0
@@ -358,7 +359,9 @@ def stage1_clean(df):
     _pm_map = {v: _normalize_payment_scalar(v) for v in _pm_uniq}
     df['payment_method'] = df['payment_method'].map(_pm_map).fillna('Unknown')
     if 'transaction_status' in df.columns:
-        df['transaction_status'] = df['transaction_status'].apply(_normalize_status_scalar)
+        _ts_uniq = df['transaction_status'].dropna().unique()
+        _ts_map = {v: _normalize_status_scalar(v) for v in _ts_uniq}
+        df['transaction_status'] = df['transaction_status'].map(_ts_map)
 
     # Validate IPs
     ip_valid_series = _validate_ip_vectorized(df['ip_address'])
