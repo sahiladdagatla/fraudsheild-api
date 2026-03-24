@@ -785,9 +785,11 @@ def _unsupervised_model(df, X, all_features):
     else:
         X_sample = X
 
-    # === METHOD 1: Multi-contamination Isolation Forest ensemble ===
-    contaminations = [0.08, 0.12] if is_large else [0.08, 0.10, 0.12]
-    n_estimators_if = 50 if is_large else 80
+    # === METHOD 1: Isolation Forest ensemble ===
+    # Fast path for small datasets: fewer models, fewer trees
+    is_small = n_samples < 5000
+    contaminations = [0.08, 0.12] if (is_large or is_small) else [0.08, 0.10, 0.12]
+    n_estimators_if = 30 if is_small else (50 if is_large else 80)
     iso_score_sum = np.zeros(n_samples)
     iso_vote_sum = np.zeros(n_samples)
     for cont in contaminations:
@@ -968,9 +970,9 @@ def _unsupervised_model(df, X, all_features):
     fraud_ratio = max(y_train.mean(), 0.01)
     pos_weight = max(1, int((1 - fraud_ratio) / fraud_ratio))
 
-    n_est_xgb = 80 if is_large else 150
-    n_est_rf = 50 if is_large else 100
-    n_est_gb = 40 if is_large else 80
+    n_est_xgb = 80 if is_large else (50 if is_small else 150)
+    n_est_rf = 50 if is_large else (30 if is_small else 100)
+    n_est_gb = 40 if is_large else (25 if is_small else 80)
 
     xgb_clf = XGBClassifier(
         n_estimators=n_est_xgb, max_depth=5, learning_rate=0.03,
